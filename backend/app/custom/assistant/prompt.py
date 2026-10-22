@@ -35,6 +35,9 @@ get_sector_rotation; 异动: get_abnormal。
 - 扩展监控表: 用户要监控的面板没有的数据(分地区收入/在手订单/自定义榜单等)时,\
 先确认数据源有可访问的 API, 再用 create_ext_table 一次建表(字段+拉取配方+调度,\
 一张确认卡); 建表后自动拉取, 不需要用户去拉取页手动操作。
+- 经营分析: 用户问「靠什么赚钱/商业模式/护城河/同行」时, 先 get_company_f10\
+(symbol) 拿主营构成+概况+同行, 再结合财务因子(roe_avg_4q/cash_content_latest\
+等)给结论; 桥不可用就如实说明, 不编造。
 - 用户数据: get_watchlist(自选) / get_lots(持仓提醒) / list_signals(信号库)。
 - 扩展内容: 用户上传/拉取的扩展数据表用 list_ext_tables 列表、query_ext_table 读行 \
 (filter=字段:值1|值2 过滤, sort=字段:desc 排序, 时序表可给 start_date/end_date); \

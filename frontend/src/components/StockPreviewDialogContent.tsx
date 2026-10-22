@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
-import { X, RefreshCw, Clock, LineChart, Star, RadioTower, Maximize2, Minimize2, Activity } from 'lucide-react'
+import { X, RefreshCw, Clock, LineChart, Star, RadioTower, Maximize2, Minimize2, Activity, Briefcase } from 'lucide-react'
+import { F10Panel } from '@/components/F10Panel'
 import { api } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { cn } from '@/lib/cn'
@@ -51,7 +52,7 @@ const PRESETS: { label: string; months: number }[] = [
   { label: '1年', months: 12 },
 ]
 
-type PreviewView = 'daily' | 'intraday'
+type PreviewView = 'daily' | 'intraday' | 'f10'
 interface PriceAlertDraft {
   id: number
   targetPrice: number
@@ -316,6 +317,18 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                     <Clock className="h-3 w-3" />
                     分时
                   </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={view === 'f10'}
+                    onClick={() => setView('f10')}
+                    className={`inline-flex h-6 items-center gap-1 rounded px-2.5 text-[11px] transition-colors ${
+                      view === 'f10' ? 'bg-accent/20 text-accent font-medium' : 'text-muted hover:text-secondary hover:bg-elevated/60'
+                    }`}
+                  >
+                    <Briefcase className="h-3 w-3" />
+                    经营
+                  </button>
                 </div>
                 <span className="h-4 w-px shrink-0 bg-border/70" />
                 {/* 区间选择 — 随视图切换 */}
@@ -360,7 +373,7 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                       min={dateRange.start}
                     />
                   </div>
-                ) : (
+                ) : view === 'intraday' ? (
                   <div className="inline-flex items-center gap-2">
                     <div className="inline-flex shrink-0 items-center rounded border border-border/60 bg-base/60 p-0.5" aria-label="分时周期">
                       {dayOptions.map(days => (
@@ -380,7 +393,7 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                       ))}
                     </div>
                   </div>
-                )}
+                ) : null}
               </div>
 
               <div className="flex shrink-0 items-center gap-1">
@@ -546,7 +559,7 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                   dailyKlineFlex="flex-[1.4]"
                   addedDate={addedDate}
                 />
-              ) : (
+              ) : view === 'intraday' ? (
                 <div className="flex flex-col gap-3">
                 <StockPanel
                   symbol={symbol}
@@ -565,6 +578,8 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                   onPriceDoubleClick={openPriceAlert}
                 />
                 </div>
+              ) : (
+                <F10Panel symbol={symbol} />
               )}
               </div>
             </div>

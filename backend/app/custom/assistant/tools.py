@@ -502,6 +502,53 @@ def _get_financials(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     return {"symbol": symbol, "table": table, "count": len(rows), "rows": rows}
 
 
+async def _get_company_f10(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """F10 经营数据查询(只读, AKShare 桥): 主营构成 / 公司概况 / 同行清单。
+
+    用于经营视角分析(issue #6/#7 前置): 商业模式看 zygc(分产品/分地区拆解),
+    行业归属与主营文本看 profile, 横向对比拿 peers。桥不可达时如实报错,
+    不编造数据。返回体有界: zygc 只取最新报告期, peers 截 15 只。
+    """
+    from fastapi import HTTPException
+
+    from app.api.f10 import _bridge_get, _normalize_zygc
+
+    symbol = _validate_symbol(args.get("symbol"))
+    section = str(args.get("section") or "all")
+    if section not in {"all", "zygc", "profile", "peers"}:
+        raise ValueError("section 必须是 all / zygc / profile / peers 之一。")
+
+    async def _fetch(path: str) -> dict[str, Any]:
+        try:
+            return await _bridge_get(path)
+        except HTTPException as exc:
+            raise ValueError(str(getattr(exc, "detail", "") or exc)) from exc
+
+    result: dict[str, Any] = {"symbol": symbol, "section": section}
+    if section in {"all", "zygc"}:
+        normalized = _normalize_zygc(await _fetch(f"/f10/zygc/{symbol}"))
+        latest = normalized["periods"][0] if normalized["periods"] else {"report_date": None, "items": []}
+        result["zygc"] = {
+            "latest_date": latest["report_date"],
+            "items": latest["items"][:20],
+        }
+    if section in {"all", "profile"}:
+        profile = (await _fetch(f"/f10/profile/{symbol}")).get("profile") or {}
+        keep_fields = (
+            "公司名称", "A股简称", "主营业务", "所属行业", "上市日期",
+            "注册资金", "注册地址", "入选指数",
+        )
+        result["profile"] = {k: profile[k] for k in keep_fields if profile.get(k)}
+    if section in {"all", "peers"}:
+        peers_payload = await _fetch(f"/f10/peers/{symbol}")
+        result["peers"] = {
+            "industry": peers_payload.get("industry"),
+            "degraded": bool(peers_payload.get("degraded")),
+            "list": (peers_payload.get("peers") or [])[:15],
+        }
+    return result
+
+
 def _get_watchlist(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     from app.services import watchlist as watchlist_service
 
@@ -1394,6 +1441,7 @@ _LOCAL_TOOLS: dict[str, Callable[[dict[str, Any], ToolContext], Any]] = {
     "get_stock_daily": _get_stock_daily,
     "get_stock_analysis": _get_stock_analysis,
     "get_financials": _get_financials,
+    "get_company_f10": _get_company_f10,
     "get_watchlist": _get_watchlist,
     "get_market_overview": _get_market_overview,
     "get_indices": _get_indices,
@@ -1466,6 +1514,21 @@ def _local_tool_schemas() -> list[dict[str, Any]]:
                 "symbol": {"type": "string", "description": "证券代码"},
                 "table": {"type": "string", "enum": ["metrics", "income", "balance_sheet", "cash_flow", "shares"], "description": "报表类型, 默认 metrics"},
                 "periods": {"type": "integer", "description": "最近 N 个报告期 (1-8, 默认 4)"},
+            },
+            ["symbol"],
+        ),
+        _schema(
+            "get_company_f10",
+            "查询公司 F10 经营数据(只读): 主营构成(zygc=分产品/分地区收入与毛利率拆解) / "
+            "公司概况(profile=主营业务全文/所属行业/上市日期) / 同行清单(peers=同行业公司)。"
+            "分析商业模式、护城河、行业归属时优先调用; 数据来自 AKShare 桥, "
+            "桥不可用时工具会报错 — 如实转告用户, 不编造经营数据。",
+            {
+                "symbol": {"type": "string", "description": "证券代码, 如 600519.SH"},
+                "section": {
+                    "type": "string", "enum": ["all", "zygc", "profile", "peers"],
+                    "description": "默认 all(三段都取); 只需某段时单独指定",
+                },
             },
             ["symbol"],
         ),
@@ -1807,6 +1870,16 @@ def summarize_tool_result(name: str, payload: dict[str, Any]) -> str:
     if name == "create_signal_strategy":
         signal = result.get("signal") or {}
         return f"创建信号 {signal.get('name', '-')} ({signal.get('id', '-')})"
+    if name == "get_company_f10":
+        zygc = result.get("zygc") or {}
+        peers = result.get("peers") or {}
+        parts: list[str] = []
+        if zygc:
+            parts.append(f"主营构成 {zygc.get('latest_date', '-')} {len(zygc.get('items') or [])} 项")
+        if peers:
+            mark = "(降级:仅行业名)" if peers.get("degraded") else ""
+            parts.append(f"行业「{peers.get('industry', '-')}」同行 {len(peers.get('list') or [])} 只{mark}")
+        return "; ".join(parts) or "返回 F10 数据"
     if name == "add_to_watchlist":
         return result.get("note") or "已加入自选"
     if name == "create_ext_table":

@@ -13,11 +13,11 @@ export interface FrontendSlotContextMap {
   'layout.header.quick': Record<string, never>
   /** 设置→系统「界面」区尾部 — 扩展注册系统级开关行 (样式与核心 ToggleRow 同款) */
   'settings.system.section': Record<string, never>
-  /** 个股详情对话框底部扩展区 (日K/分时图表下方) */
+  /** 个股详情对话框底部扩展区 (日K/分时/经营视图下方) */
   'stock-preview.footer': {
     symbol: string
     name: string | null
-    view: 'daily' | 'intraday'
+    view: 'daily' | 'intraday' | 'f10'
   }
   /** 自选页工具栏扩展区 (按钮行末尾) */
   'watchlist.toolbar': {
