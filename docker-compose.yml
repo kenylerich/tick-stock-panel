@@ -32,3 +32,14 @@ services:
       # Windows PowerShell/CMD 下 HOME 常未设置, 可通过 .env 里 CODEX_HOME_HOST 覆盖。
       - ${CODEX_HOME_HOST:-${HOME}/.codex}:/root/.codex:ro
     restart: unless-stopped
+
+  # AKShare 免费数据桥 (issue #4): F10 主营构成/公司概况/同行清单。
+  # 可插拔侧车: 停掉此服务不影响主面板; 主容器经 http://akshare-bridge:3020 访问。
+  akshare-bridge:
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile
+    container_name: TSP_AKShare_Bridge
+    ports:
+      - "127.0.0.1:3020:3020"
+    restart: unless-stopped

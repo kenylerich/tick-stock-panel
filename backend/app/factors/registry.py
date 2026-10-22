@@ -298,6 +298,22 @@ _CATALOG: tuple[FactorSpec, ...] = (
         "KDJ K值 - D值, 正值代表快线在慢线上方",
         deps=frozenset({"kdj_k", "kdj_d"}),
     ),
+    # --- 财务扩充批次 (2026-10-21, issue #2/#3): 全部追加在目录末尾, 不重排 ---
+    _financial("pe_latest", "市盈率(最新公告)", "PE = 市净率/ROE 恒等换算; ROE≤0(亏损)或无数据为空"),
+    _financial("roa_latest", "ROA(最新公告)", "最新已公告总资产收益率(%)"),
+    _financial("eps_diluted_latest", "稀释EPS(最新公告)", "最新已公告稀释每股收益(元)"),
+    _financial("ocfps_latest", "每股经营现金流(最新公告)", "最新已公告每股经营现金流(元); 持续低于EPS提示利润含金量不足"),
+    _financial("cash_content_latest", "净现比(最新公告)", "经营活动现金净流量/净利润(%); >100% 代表利润有真金白银支撑"),
+    _financial("ocf_revenue_latest", "经营现金流/营收(最新公告)", "每元收入的经营现金含量(%)"),
+    _financial("current_ratio_latest", "流动比率(最新公告)", "流动资产/流动负债"),
+    _financial("quick_ratio_latest", "速动比率(最新公告)", "(流动资产-存货)/流动负债"),
+    _financial("lt_debt_equity_latest", "长期资本负债比(最新公告)", "长期负债/(长期负债+股东权益)(%)"),
+    _financial("asset_growth_latest", "总资产增速(最新公告)", "总资产同比增长(%)"),
+    _financial("roe_avg_4q", "ROE均值(近4季)", "近4个报告期ROE均值; 不足4期为空"),
+    _financial("roe_min_8q", "ROE下限(近8季)", "近8个报告期ROE最低值; 衡量盈利稳定性"),
+    _financial("revenue_yoy_improving", "营收增速改善", "最新营收增速 > 4期前营收增速(1/0)"),
+    _financial("net_margin_trend", "净利率趋势", "最新净利率 - 4期前净利率(百分点)"),
+    _financial("eps_trend", "EPS趋势", "最新EPS - 4期前EPS(元)"),
 )
 
 _REGISTRY: dict[str, FactorSpec] = {}

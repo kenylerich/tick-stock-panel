@@ -278,3 +278,171 @@ def test_financial_sync_merge_unknown_announce_date_does_not_win():
     row = fs._merge_report_history(old_missing, revised).to_dicts()[0]
     assert row["announce_date"] == "2026-02-01"
     assert row["roe"] == 9.5
+
+
+# ── A1/A2 扩充批次 (issue #2/#3) ────────────────────────────────
+
+def test_pe_derived_from_pb_over_roe():
+    """PE = (close/bps) / (roe/100); 亏损或 bps≤0 置 null; 双路径一致。"""
+    panel = _daily_panel(date(2026, 4, 1), 10, ("600000.SH", "000001.SZ"))
+    snapshot = _snapshot_frame([
+        {"symbol": "600000.SH", "announce": "2026-04-05", "roe": 20.0, "bps": 4.0},
+        {"symbol": "000001.SZ", "announce": "2026-04-05", "roe": -5.0, "bps": 4.0},
+    ])
+    names = ["pe_latest"]
+    attached = attach_fundamental_factors(panel, snapshot, names).sort("date")
+    pe = attached.filter(pl.col("symbol") == "600000.SH")["pe_latest"].to_list()
+    assert pe[:5] == [None] * 5
+    close_6 = attached.filter(
+        (pl.col("symbol") == "600000.SH") & (pl.col("date") == date(2026, 4, 6)),
+    )["close"].item()
+    assert abs(pe[5] - (close_6 / 4.0) / 0.2) < 1e-9
+    # 亏损股 PE 无意义 → null
+    loss = attached.filter(pl.col("symbol") == "000001.SZ")["pe_latest"]
+    assert loss.null_count() == loss.len()
+
+    market = build_market_data_matrix(panel)
+    matrices = build_fundamental_matrices(market, snapshot, names)
+    symbols = {s: i for i, s in enumerate(market.symbols)}
+    t6 = 5
+    np.testing.assert_allclose(
+        matrices["pe_latest"][t6, symbols["600000.SH"]],
+        (close_6 / 4.0) / 0.2, rtol=1e-6,
+    )
+    assert np.isnan(matrices["pe_latest"][t6, symbols["000001.SZ"]])
+
+
+def test_new_plain_column_factors_attach():
+    """纯列新因子(roa/ocfps/净现比等)沿用同一门控与 null 语义。"""
+    frame = _snapshot_frame([
+        {"symbol": "600000.SH", "announce": "2026-04-05", "roe": 20.0, "bps": 4.0},
+    ]).with_columns(
+        pl.lit(5.5, dtype=pl.Float64).alias("roa"),
+        pl.lit(1.2, dtype=pl.Float64).alias("ocfps"),
+        pl.lit(130.0, dtype=pl.Float64).alias("net_profit_cash_content"),
+    )
+    panel = _daily_panel(date(2026, 4, 1), 8, ("600000.SH",))
+    attached = attach_fundamental_factors(
+        panel, frame, ["roa_latest", "ocfps_latest", "cash_content_latest"],
+    ).sort("date")
+    expected = {
+        "roa_latest": 5.5, "ocfps_latest": 1.2, "cash_content_latest": 130.0,
+    }
+    for name, want in expected.items():
+        values = attached[name].to_list()
+        assert values[:5] == [None] * 5
+        assert all(abs(v - want) < 1e-12 for v in values[5:])
+
+
+def test_snapshot_missing_new_columns_degrades_to_null():
+    """旧测试桩/旧缓存缺新列: 双路径优雅降级为 null, 不抛异常。"""
+    panel = _daily_panel(date(2026, 4, 1), 6, ("600000.SH",))
+    snapshot = _snapshot_frame([
+        {"symbol": "600000.SH", "announce": "2026-04-05", "roe": 20.0, "bps": 4.0},
+    ])  # 无 roa/ocfps/趋势列
+    attached = attach_fundamental_factors(
+        panel, snapshot, ["roa_latest", "roe_avg_4q", "pe_latest"],
+    )
+    for name in ("roa_latest", "roe_avg_4q"):
+        series = attached[name]
+        assert series.null_count() == series.len()
+    market = build_market_data_matrix(panel)
+    matrices = build_fundamental_matrices(market, snapshot, ["roa_latest", "roe_avg_4q"])
+    assert np.isnan(matrices["roa_latest"]).all()
+    assert np.isnan(matrices["roe_avg_4q"]).all()
+
+
+def test_trend_columns_computed_on_period_series():
+    """趋势列: 4期窗口均值 / 不足期 null / 跨 symbol 不串 / improving 对比4期前。"""
+    from app.backtest.fundamentals import _add_trend_columns
+
+    quarters = ["2025-06-30", "2025-09-30", "2025-12-31", "2026-03-31", "2026-06-30"]
+    rows = {
+        "symbol": ["600000.SH"] * 5 + ["000001.SZ"] * 2,
+        "period_end": quarters + ["2025-12-31", "2026-03-31"],
+        "announce_date": ["2025-08-30", "2025-11-01", "2026-03-01", "2026-04-20", "2026-08-15",
+                          "2026-03-05", "2026-04-25"],
+        "roe": [10.0, 12.0, 11.0, 13.0, 14.0, 50.0, 51.0],
+        "revenue_yoy": [5.0, 6.0, 4.0, 8.0, 10.0, 1.0, 2.0],
+        "net_margin": [10.0, 11.0, 12.0, 13.0, 14.0, 30.0, 31.0],
+        "eps_basic": [1.0, 1.1, 1.2, 1.3, 1.4, 2.0, 2.1],
+    }
+    out = _add_trend_columns(pl.DataFrame(rows))
+    main = out.filter(pl.col("symbol") == "600000.SH").sort("period_end")
+    avg4 = main["roe_avg_4q"].to_list()
+    assert avg4[:3] == [None, None, None]          # 不足 4 期
+    assert abs(avg4[3] - (10 + 12 + 11 + 13) / 4) < 1e-12
+    assert abs(avg4[4] - (12 + 11 + 13 + 14) / 4) < 1e-12
+    min8 = main["roe_min_8q"].to_list()
+    assert min8[3] is None and min8[4] is None  # 窗口=8: 不足 8 期为 null
+    improving = main["revenue_yoy_improving"].to_list()
+    assert improving[3] is None                     # 第4期尚无"4期前"
+    assert improving[4] == 1.0                      # 10.0 > 5.0 (4期前)
+    margin_trend = main["net_margin_trend"].to_list()
+    assert margin_trend[3] is None
+    assert margin_trend[4] == 14.0 - 10.0          # 4期前 = 第1期(10.0)
+    # 跨 symbol 不串: 另一只股票只有 2 期, 趋势列全 null
+    other = out.filter(pl.col("symbol") == "000001.SZ")
+    for col in ("roe_avg_4q", "revenue_yoy_improving", "net_margin_trend"):
+        series = other[col]
+        assert series.null_count() == series.len()
+
+
+def test_trend_factor_pit_gated_on_announce():
+    """趋势列沿公告日门控生效: 公告前 null, 生效后为该期趋势值。"""
+    quarters = ["2025-06-30", "2025-09-30", "2025-12-31", "2026-03-31"]
+    frame = pl.DataFrame({
+        "symbol": ["600000.SH"] * 4,
+        "period_end": quarters,
+        "announce_date": ["2025-08-30", "2025-11-01", "2026-03-01", "2026-04-20"],
+        "roe": [10.0, 12.0, 11.0, 13.0],
+        "bps": [4.0] * 4,
+        "revenue_yoy": [5.0, 6.0, 4.0, 8.0],
+    }).with_columns(
+        pl.col("announce_date").str.slice(0, 10).str.to_date().alias("_announce"),
+    ).sort(["symbol", "_announce"])
+    from app.backtest.fundamentals import _add_trend_columns
+    snapshot = _add_trend_columns(frame).sort(["symbol", "_announce"])
+
+    panel = _daily_panel(date(2026, 3, 25), 35, ("600000.SH",))
+    attached = attach_fundamental_factors(panel, snapshot, ["roe_avg_4q"]).sort("date")
+    values = attached["roe_avg_4q"].to_list()
+    dates = attached["date"].to_list()
+    idx_effective = dates.index(date(2026, 4, 21))  # 4-20 公告 → 次日起生效
+    assert values[idx_effective - 1] is None
+    assert abs(values[idx_effective] - (10 + 12 + 11 + 13) / 4) < 1e-12
+
+
+def test_load_snapshot_includes_new_factor_columns(tmp_path: Path):
+    """load 快照读取新因子列并预计算趋势列。"""
+    out = tmp_path / "financials" / "metrics"
+    out.mkdir(parents=True)
+    quarters = ["2025-06-30", "2025-09-30", "2025-12-31", "2026-03-31"]
+    pl.DataFrame({
+        "symbol": ["600000.SH"] * 4,
+        "period_end": quarters,
+        "announce_date": ["2025-08-30", "2025-11-01", "2026-03-01", "2026-04-20"],
+        "roe": [10.0, 12.0, 11.0, 13.0],
+        "bps": [4.0] * 4,
+        "revenue_yoy": [5.0, 6.0, 4.0, 8.0],
+        "net_margin": [10.0, 11.0, 12.0, 13.0],
+        "eps_basic": [1.0, 1.1, 1.2, 1.3],
+        "roa": [3.0] * 4,
+        "ocfps": [1.1] * 4,
+        "net_profit_cash_content": [120.0] * 4,
+        "operating_cash_to_revenue": [12.0] * 4,
+        "current_ratio": [1.5] * 4,
+        "quick_ratio": [1.0] * 4,
+        "long_term_debt_equity_ratio": [20.0] * 4,
+        "total_assets_growth_ratio": [8.0] * 4,
+        "eps_diluted": [1.0] * 4,
+    }).write_parquet(out / "part.parquet")
+    snapshot = load_fundamental_snapshot(tmp_path)
+    assert snapshot is not None
+    for col in ("roa", "ocfps", "roe_avg_4q", "roe_min_8q", "net_margin_trend"):
+        assert col in snapshot.columns
+    last = snapshot.filter(pl.col("symbol") == "600000.SH").sort("_announce").row(-1, named=True)
+    assert abs(last["roe_avg_4q"] - (10 + 12 + 11 + 13) / 4) < 1e-12
+    # 只有 4 期: "对比4期前"类趋势尚无值 (需第 5 期)
+    assert last["net_margin_trend"] is None
+    assert last["eps_trend"] is None

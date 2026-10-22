@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 
 # 财务因子名 -> (metrics 表列名, 是否需要除以收盘价)
 # pb_latest 单列声明为 bps 倒数口径: 因子值 = close / bps。
+# 扩展 spec 字段 (A1/A2):
+# - requires: 该因子需要的原始快照列 (默认 [column]; 派生因子给多列);
+# - formula: 派生公式标记, 当前仅 "pe" (PE = (close/bps) / (roe/100),
+#   即 PB/ROE 恒等换算, ROE≤0 时置空 — 亏损股 PE 无比较意义);
+# - trend: True 表示该列由 _add_trend_columns 在报告期序列上预计算
+#   (rolling 只用 ≤当期数据, 生效时间沿用该行 announce_date, 无未来函数)。
 FUNDAMENTAL_FACTORS: dict[str, dict[str, Any]] = {
     "pb_latest": {"column": "bps", "price_ratio": True},
     "roe_latest": {"column": "roe", "price_ratio": False},
@@ -36,9 +42,92 @@ FUNDAMENTAL_FACTORS: dict[str, dict[str, Any]] = {
     "revenue_yoy_latest": {"column": "revenue_yoy", "price_ratio": False},
     "net_income_yoy_latest": {"column": "net_income_yoy", "price_ratio": False},
     "debt_ratio_latest": {"column": "debt_to_asset_ratio", "price_ratio": False},
+    # --- A1 扩充 (2026-10-21): 纯 metrics 列 + PE 派生 ---
+    "pe_latest": {
+        "column": "roe", "price_ratio": False, "formula": "pe",
+        "requires": ["bps", "roe"],
+    },
+    "roa_latest": {"column": "roa", "price_ratio": False},
+    "eps_diluted_latest": {"column": "eps_diluted", "price_ratio": False},
+    "ocfps_latest": {"column": "ocfps", "price_ratio": False},
+    "cash_content_latest": {"column": "net_profit_cash_content", "price_ratio": False},
+    "ocf_revenue_latest": {"column": "operating_cash_to_revenue", "price_ratio": False},
+    "current_ratio_latest": {"column": "current_ratio", "price_ratio": False},
+    "quick_ratio_latest": {"column": "quick_ratio", "price_ratio": False},
+    "lt_debt_equity_latest": {"column": "long_term_debt_equity_ratio", "price_ratio": False},
+    "asset_growth_latest": {"column": "total_assets_growth_ratio", "price_ratio": False},
+    # --- A2 趋势因子 (报告期序列预计算列) ---
+    "roe_avg_4q": {"column": "roe_avg_4q", "price_ratio": False, "trend": True},
+    "roe_min_8q": {"column": "roe_min_8q", "price_ratio": False, "trend": True},
+    "revenue_yoy_improving": {
+        "column": "revenue_yoy_improving", "price_ratio": False, "trend": True,
+    },
+    "net_margin_trend": {"column": "net_margin_trend", "price_ratio": False, "trend": True},
+    "eps_trend": {"column": "eps_trend", "price_ratio": False, "trend": True},
 }
 
 FUNDAMENTAL_FACTOR_NAMES = frozenset(FUNDAMENTAL_FACTORS)
+
+# 趋势因子依赖的基础列 (加载快照时一并读取供 _add_trend_columns 使用)。
+_TREND_SOURCE_COLUMNS: tuple[str, ...] = ("roe", "revenue_yoy", "net_margin", "eps_basic")
+
+
+def _required_raw_columns(name: str) -> list[str]:
+    """因子所需的原始快照列; 派生/趋势因子给多列, 其余单列。"""
+    spec = FUNDAMENTAL_FACTORS[name]
+    return list(spec.get("requires") or [spec["column"]])
+
+
+def _snapshot_missing_columns(snapshot: pl.DataFrame, names: list[str]) -> list[str]:
+    """names 涉及的原始列中, snapshot 缺失的部分 (测试桩/旧缓存可能缺列)。"""
+    required: set[str] = set()
+    for name in names:
+        required.update(_required_raw_columns(name))
+    return sorted(required - set(snapshot.columns))
+
+
+def _fill_missing_snapshot_columns(snapshot: pl.DataFrame, names: list[str]) -> pl.DataFrame:
+    """缺列补 null (Float64), 双路径对缺列输入优雅降级而非报错。"""
+    missing = _snapshot_missing_columns(snapshot, names)
+    if not missing:
+        return snapshot
+    return snapshot.with_columns([
+        pl.lit(None, dtype=pl.Float64).alias(c) for c in missing
+    ])
+
+
+def _add_trend_columns(snapshot: pl.DataFrame) -> pl.DataFrame:
+    """A2 趋势列: 按 (symbol, period_end) 报告期序列预计算。
+
+    - rolling_mean/rolling_min 的 min_periods 等于窗口: 不足 N 期 = null;
+    - 「变化类」(improving/trend) 用 shift(4) 对比 4 期前, 任一侧为 null 则 null;
+    - 每行趋势值只用 period_end ≤ 当期的行, 随该行 announce_date 生效 — 无未来函数。
+    """
+    missing_sources = [c for c in _TREND_SOURCE_COLUMNS if c not in snapshot.columns]
+    if missing_sources:
+        # 基础列缺失 (如测试桩只给部分列): 补 null 后趋势列自然全 null 降级。
+        snapshot = snapshot.with_columns([
+            pl.lit(None, dtype=pl.Float64).alias(c) for c in missing_sources
+        ])
+    if "period_end" not in snapshot.columns:
+        # 无报告期列无法定序: 趋势列全 null 降级。
+        return snapshot.with_columns([
+            pl.lit(None, dtype=pl.Float64).alias(c)
+            for c in ("roe_avg_4q", "roe_min_8q", "revenue_yoy_improving", "net_margin_trend", "eps_trend")
+        ])
+    ordered = snapshot.sort(["symbol", "period_end"])
+    prev_roe_yoy = pl.col("revenue_yoy").shift(4).over("symbol")
+    return ordered.with_columns(
+        pl.col("roe").rolling_mean(4).over("symbol").alias("roe_avg_4q"),
+        pl.col("roe").rolling_min(8).over("symbol").alias("roe_min_8q"),
+        pl
+        .when(pl.col("revenue_yoy").is_not_null() & prev_roe_yoy.is_not_null())
+        .then((pl.col("revenue_yoy") > prev_roe_yoy).cast(pl.Float64))
+        .otherwise(None)
+        .alias("revenue_yoy_improving"),
+        (pl.col("net_margin") - pl.col("net_margin").shift(4).over("symbol")).alias("net_margin_trend"),
+        (pl.col("eps_basic") - pl.col("eps_basic").shift(4).over("symbol")).alias("eps_trend"),
+    )
 
 
 def load_fundamental_snapshot(data_dir: Path | None) -> pl.DataFrame | None:
@@ -56,14 +145,22 @@ def load_fundamental_snapshot(data_dir: Path | None) -> pl.DataFrame | None:
     except Exception as exc:
         logger.warning("读取财务指标快照失败: %s", exc)
         return None
-    needed = {"symbol", "announce_date"} | {
-        spec["column"] for spec in FUNDAMENTAL_FACTORS.values()
-    }
-    if not needed.issubset(frame.columns):
-        logger.warning("财务指标快照缺少列: %s", sorted(needed - set(frame.columns)))
+    needed = {"symbol", "announce_date", "period_end"} | {
+        col
+        for name in FUNDAMENTAL_FACTORS
+        for col in _required_raw_columns(name)
+    } | set(_TREND_SOURCE_COLUMNS)
+    available = needed & set(frame.columns)
+    missing = needed - available
+    if missing:
+        # 只警告不整体失效: 换源/旧缓存缺个别列时, 其余因子照常可用,
+        # 缺列因子在 attach/matrix 路径按 null 降级。
+        logger.warning("财务指标快照缺少列(相关因子将为空): %s", sorted(missing))
+    if not {"symbol", "announce_date"} <= available:
+        logger.warning("财务指标快照缺少基础列, 视为无有效快照")
         return None
     snapshot = (
-        frame.select(sorted(needed))
+        frame.select(sorted(available))
         .filter(
             pl.col("symbol").is_not_null()
             & pl.col("announce_date").is_not_null()
@@ -75,6 +172,8 @@ def load_fundamental_snapshot(data_dir: Path | None) -> pl.DataFrame | None:
     )
     if snapshot.is_empty():
         return None
+    # A2: 报告期序列预计算趋势列, 随后恢复按公告日排序 (join/矩阵路径的契约顺序)。
+    snapshot = _add_trend_columns(snapshot).sort(["symbol", "_announce"])
     return snapshot
 
 
@@ -100,8 +199,9 @@ def attach_fundamental_factors(
             for name in missing_columns
         ])
 
+    snapshot = _fill_missing_snapshot_columns(snapshot, missing_columns)
     columns = sorted(
-        {FUNDAMENTAL_FACTORS[name]["column"] for name in missing_columns}
+        {col for name in missing_columns for col in _required_raw_columns(name)}
     )
     # asof 键取生效日 (公告日次日) 而非公告日: 直接用公告日回看会在换报告期的
     # 公告当日取到「尚未生效」的新一期并被门控置 null, 打断上一期的前向填充,
@@ -123,15 +223,24 @@ def attach_fundamental_factors(
     expressions = []
     for name in missing_columns:
         spec = FUNDAMENTAL_FACTORS[name]
-        source = pl.col(spec["column"])
-        if spec["price_ratio"]:
+        if spec.get("formula") == "pe":
+            # PE = (close / bps) / (roe / 100), 即 PB/ROE 恒等换算;
+            # bps≤0 或 roe≤0 (亏损) 置 null — 负 PE 无比较意义。
             value = (
-                pl.when(source > 0)
-                .then(pl.col("close") / source)
+                pl.when((pl.col("bps") > 0) & (pl.col("roe") > 0))
+                .then((pl.col("close") / pl.col("bps")) / (pl.col("roe") / 100.0))
                 .otherwise(None)
             )
         else:
-            value = source
+            source = pl.col(spec["column"])
+            if spec["price_ratio"]:
+                value = (
+                    pl.when(source > 0)
+                    .then(pl.col("close") / source)
+                    .otherwise(None)
+                )
+            else:
+                value = source
         expressions.append(
             pl.when(announced).then(value).otherwise(None).alias(name)
         )
@@ -163,9 +272,11 @@ def build_fundamental_matrices(
     labels = market.timestamp_labels
     label_dates = np.array([label[:10] for label in labels], dtype="datetime64[D]")
 
+    snapshot = _fill_missing_snapshot_columns(snapshot, requested)
     raw_columns = {
-        FUNDAMENTAL_FACTORS[name]["column"]: np.full(shape, np.nan, dtype=np.float32)
+        col: np.full(shape, np.nan, dtype=np.float32)
         for name in requested
+        for col in _required_raw_columns(name)
     }
     announce_text = snapshot["announce_date"].str.slice(0, 10)
     for row_index, symbol in enumerate(snapshot["symbol"].to_list()):
@@ -189,14 +300,22 @@ def build_fundamental_matrices(
 
     for name in requested:
         spec = FUNDAMENTAL_FACTORS[name]
-        source = raw_columns[spec["column"]]
-        if spec["price_ratio"]:
+        if spec.get("formula") == "pe":
+            bps = raw_columns["bps"]
+            roe = raw_columns["roe"]
             with np.errstate(divide="ignore", invalid="ignore"):
-                matrix = (market.close / source).astype(np.float32)
-            matrix[~(source > 0)] = np.nan
+                matrix = ((market.close / bps) / (roe / 100.0)).astype(np.float32)
+            matrix[~((bps > 0) & (roe > 0))] = np.nan
             matrix[np.isinf(matrix)] = np.nan
         else:
-            matrix = source
+            source = raw_columns[spec["column"]]
+            if spec["price_ratio"]:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    matrix = (market.close / source).astype(np.float32)
+                matrix[~(source > 0)] = np.nan
+                matrix[np.isinf(matrix)] = np.nan
+            else:
+                matrix = source
         result[name] = matrix
     return result
 

@@ -99,6 +99,22 @@ GOLDEN_COLUMNS: list[dict] = [
     {"id": "position_240d", "label": "一年价格位置", "group": "价格位置", "desc": "收盘价在近240个交易日最低价到最高价之间的位置 (0~1)"},
     {"id": "distance_to_high_240d", "label": "距一年高点", "group": "价格位置", "desc": "收盘价 / 240日最高收盘价 - 1, 接近0代表贴近一年新高"},
     {"id": "kdj_kd_diff", "label": "KDJ K-D差", "group": "趋势", "desc": "KDJ K值 - D值, 正值代表快线在慢线上方"},
+    # --- 财务扩充批次 (2026-10-21, issue #2/#3): 追加在目录末尾 ---
+    {"id": "pe_latest", "label": "市盈率(最新公告)", "group": "财务", "desc": "PE = 市净率/ROE 恒等换算; ROE≤0(亏损)或无数据为空"},
+    {"id": "roa_latest", "label": "ROA(最新公告)", "group": "财务", "desc": "最新已公告总资产收益率(%)"},
+    {"id": "eps_diluted_latest", "label": "稀释EPS(最新公告)", "group": "财务", "desc": "最新已公告稀释每股收益(元)"},
+    {"id": "ocfps_latest", "label": "每股经营现金流(最新公告)", "group": "财务", "desc": "最新已公告每股经营现金流(元); 持续低于EPS提示利润含金量不足"},
+    {"id": "cash_content_latest", "label": "净现比(最新公告)", "group": "财务", "desc": "经营活动现金净流量/净利润(%); >100% 代表利润有真金白银支撑"},
+    {"id": "ocf_revenue_latest", "label": "经营现金流/营收(最新公告)", "group": "财务", "desc": "每元收入的经营现金含量(%)"},
+    {"id": "current_ratio_latest", "label": "流动比率(最新公告)", "group": "财务", "desc": "流动资产/流动负债"},
+    {"id": "quick_ratio_latest", "label": "速动比率(最新公告)", "group": "财务", "desc": "(流动资产-存货)/流动负债"},
+    {"id": "lt_debt_equity_latest", "label": "长期资本负债比(最新公告)", "group": "财务", "desc": "长期负债/(长期负债+股东权益)(%)"},
+    {"id": "asset_growth_latest", "label": "总资产增速(最新公告)", "group": "财务", "desc": "总资产同比增长(%)"},
+    {"id": "roe_avg_4q", "label": "ROE均值(近4季)", "group": "财务", "desc": "近4个报告期ROE均值; 不足4期为空"},
+    {"id": "roe_min_8q", "label": "ROE下限(近8季)", "group": "财务", "desc": "近8个报告期ROE最低值; 衡量盈利稳定性"},
+    {"id": "revenue_yoy_improving", "label": "营收增速改善", "group": "财务", "desc": "最新营收增速 > 4期前营收增速(1/0)"},
+    {"id": "net_margin_trend", "label": "净利率趋势", "group": "财务", "desc": "最新净利率 - 4期前净利率(百分点)"},
+    {"id": "eps_trend", "label": "EPS趋势", "group": "财务", "desc": "最新EPS - 4期前EPS(元)"},
 ]
 
 GOLDEN_VIRTUAL_DEPS: dict[str, frozenset[str]] = {
@@ -230,12 +246,12 @@ def test_scoring_warmup_snapshot() -> None:
 
 def test_catalog_counts_and_kinds() -> None:
     specs = all_factors()
-    assert len(specs) == 77
-    assert len({spec.id for spec in specs}) == 77  # id 唯一
+    assert len(specs) == 92
+    assert len({spec.id for spec in specs}) == 92  # id 唯一
     virtual = [spec for spec in specs if spec.kind == "virtual"]
     assert len(virtual) == 52  # ma/ema 10 + 原有 26 + 扩充批次 16
     financial = [spec for spec in specs if spec.pit]
-    assert len(financial) == 7
+    assert len(financial) == 22  # 原 7 + 扩充批次 15
     assert all(spec.pit_source == "financial_announce" for spec in financial)
     assert all(spec.asset_types == frozenset({"stock"}) for spec in financial)
 
@@ -261,8 +277,8 @@ def test_get_factor_and_dependencies() -> None:
 def test_asset_type_filter() -> None:
     stock = all_factors(asset_type="stock")
     etf = all_factors(asset_type="etf")
-    assert len(stock) == 77
-    assert len(etf) == 70  # 财务 7 项仅股票
+    assert len(stock) == 92
+    assert len(etf) == 70  # 财务 22 项仅股票
 
 
 def test_register_factor_rejects_duplicate() -> None:
@@ -309,7 +325,7 @@ def test_factors_api_contract() -> None:
     assert response.status_code == 200
     payload = response.json()
     factors = payload["factors"]
-    assert len(factors) == 77
+    assert len(factors) == 92
     first = factors[0]
     assert first["id"] == "momentum_5d"
     assert first["kind"] == "base"
