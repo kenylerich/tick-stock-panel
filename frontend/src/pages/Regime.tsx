@@ -9,6 +9,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { initEChart, resizeEChart } from '@/lib/chartDpr'
 import * as echarts from 'echarts'
 import {
   Activity, RefreshCw, Loader2, Gauge, TrendingUp, TrendingDown, Minus,
@@ -93,7 +94,7 @@ function useEChart(
   const ref = useRef<HTMLDivElement>(null)
   const instRef = useRef<echarts.ECharts | null>(null)
   useEffect(() => {
-    const onResize = () => instRef.current?.resize()
+    const onResize = () => resizeEChart(instRef.current)
     window.addEventListener('resize', onResize)
     return () => {
       window.removeEventListener('resize', onResize)
@@ -107,14 +108,14 @@ function useEChart(
     // 冷加载时首帧 rows 为空 → div 不在 DOM, 仅挂载时跑一次的 init 会扑空)。
     // 数据到达后 option 变化触发本 effect, 此时 div 已挂载 — 补建实例再 setOption。
     if (!instRef.current) {
-      instRef.current = echarts.init(ref.current, undefined, { renderer: 'canvas' })
+      instRef.current = initEChart(ref.current)
       onReady?.(instRef.current)
     }
     if (option) {
       instRef.current.setOption(option, { notMerge: true })
       // 容器可能经历 display:none(tab 隐藏) → 可见的切换, 画布尺寸需要按当前
       // 容器实际尺寸重算; 调用方把 view 等显隐依赖传入 deps 以触发本 effect。
-      instRef.current.resize()
+      resizeEChart(instRef.current)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [option, ...deps])

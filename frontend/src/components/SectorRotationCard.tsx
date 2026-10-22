@@ -13,6 +13,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { initEChart, resizeEChart } from '@/lib/chartDpr'
 import * as echarts from 'echarts'
 import { Activity, Database, RefreshCw } from 'lucide-react'
 import { api, type SectorRotationSector } from '@/lib/api'
@@ -103,7 +104,7 @@ function useEChart(
   const eventsRef = useRef(events)
   eventsRef.current = events
   useEffect(() => {
-    const onResize = () => instRef.current?.resize()
+    const onResize = () => resizeEChart(instRef.current)
     window.addEventListener('resize', onResize)
     return () => {
       window.removeEventListener('resize', onResize)
@@ -132,7 +133,7 @@ function useEChart(
     // 警告 "already initialized" 并复用僵尸实例, 后续 setOption 全部落空
     const leftover = echarts.getInstanceByDom(ref.current)
     if (leftover && leftover !== instRef.current) leftover.dispose()
-    if (!instRef.current) instRef.current = echarts.init(ref.current, undefined, { renderer: 'canvas' })
+    if (!instRef.current) instRef.current = initEChart(ref.current)
     const inst = instRef.current
     // 事件回调经 ref 取最新闭包, 绑定只需覆盖实例生命周期
     inst.off('mouseover'); inst.off('mouseout'); inst.off('globalout')
@@ -141,7 +142,7 @@ function useEChart(
     inst.on('globalout', () => eventsRef.current?.onGlobalOut?.())
     if (option) {
       inst.setOption(option, { notMerge: true })
-      inst.resize()
+      resizeEChart(inst)
     }
   }, [option, reviveKey])
   return { ref, instRef }

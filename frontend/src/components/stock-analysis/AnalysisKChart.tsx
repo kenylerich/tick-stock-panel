@@ -1,6 +1,6 @@
 import { useEffect, useRef, useMemo, useState } from 'react'
 import { chartTheme, getTheme, useTheme } from '@/lib/theme'
-import * as echarts from 'echarts'
+import { initEChart, resizeEChart } from '@/lib/chartDpr'
 import type { ECharts, EChartsOption } from 'echarts'
 import type { KlineRow, LevelSeries } from '@/lib/api'
 
@@ -373,7 +373,7 @@ export function AnalysisKChart({
   useEffect(() => {
     if (!chartRef.current) return
     if (!chartInstRef.current) {
-      chartInstRef.current = echarts.init(chartRef.current, undefined, { renderer: 'canvas' })
+      chartInstRef.current = initEChart(chartRef.current)
       chartInstRef.current.on('click', (params: any) => {
         // 预留:点击 K 线(非 markPoint/markLine)回调
         if (params.componentType === 'series' && params.seriesType === 'candlestick' && onDateClick) {
@@ -397,7 +397,7 @@ export function AnalysisKChart({
   useEffect(() => {
     const inst = chartInstRef.current
     if (!inst) return
-    const onResize = () => inst.resize()
+    const onResize = () => resizeEChart(inst)
     window.addEventListener('resize', onResize)
     return () => { window.removeEventListener('resize', onResize); inst.dispose(); chartInstRef.current = null }
   }, [])

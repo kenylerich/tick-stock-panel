@@ -21,11 +21,13 @@ import { mergeSessions } from './sessionsMerge'
  * running=执行中; awaiting=动作工具等待用户确认; approved/denied=用户已点
  * 确认/拒绝(短暂中间态, 后端 tool_result 随后到达并覆盖为 ok/error)。
  */
-export type ToolCallStatus = 'running' | 'awaiting' | 'approved' | 'denied' | 'ok' | 'error'
+export type ToolCallStatus = 'running' | 'awaiting' | 'approved' | 'denied' | 'expired' | 'ok' | 'error'
 
 export interface ToolCallConfirm {
   label: string
   risk: string
+  /** 确认卡过期时刻(ms 时间戳); 到点仍 awaiting 时由倒计时自动置为 expired。 */
+  expiresAt?: number
 }
 
 export interface ToolCallRecord {
@@ -288,7 +290,11 @@ function applyEvent(event: AssistantEvent, footprintId: string, assistantId: str
                 ? {
                     ...c,
                     status: 'awaiting' as ToolCallStatus,
-                    confirm: { label: event.label, risk: event.risk },
+                    confirm: {
+                      label: event.label,
+                      risk: event.risk,
+                      expiresAt: Date.now() + event.expires_in * 1000,
+                    },
                   }
                 : c),
             }
@@ -310,6 +316,7 @@ function applyEvent(event: AssistantEvent, footprintId: string, assistantId: str
                 confirm: {
                   label: `已连续 ${event.reached} 轮工具调用仍未完成`,
                   risk: '继续将再运行一个周期(至多再 100 轮), 消耗更多时间与 token; 停止则保留已生成内容。',
+                  expiresAt: Date.now() + event.expires_in * 1000,
                 },
               }],
             }
@@ -332,11 +339,25 @@ function applyEvent(event: AssistantEvent, footprintId: string, assistantId: str
       appendMessage({ id: uid(), role: 'notice', content: event.message, ts: Date.now() })
       break
     case 'done':
-      // 流结束: 仍处于 awaiting 的确认(后端超时未执行)收敛为已取消, 卡片不再悬挂。
+      // 流结束: 仍处 awaiting 的确认(后端超时未执行)收敛为已过期, 卡片不再悬挂;
+      // approved 但未收到 tool_result 的(流中断在执行中途)收敛为 error, 提示核对结果。
       patchActiveSession(session => ({
         ...session,
         messages: session.messages.map(m => m.role === 'footprint'
-          ? { ...m, calls: m.calls.map(c => (c.status === 'awaiting' ? { ...c, status: 'denied' as ToolCallStatus } : c)) }
+          ? {
+              ...m,
+              calls: m.calls.map(c => {
+                if (c.status === 'awaiting') return { ...c, status: 'expired' as ToolCallStatus }
+                if (c.status === 'approved') {
+                  return {
+                    ...c,
+                    status: 'error' as ToolCallStatus,
+                    summary: c.summary ?? '对话已结束, 未收到执行结果; 请到对应页面核对。',
+                  }
+                }
+                return c
+              }),
+            }
           : m),
       }))
       break
@@ -417,9 +438,31 @@ export async function decideAction(callId: string, approve: boolean) {
   try {
     await decideAssistantAction(callId, approve)
   } catch {
-    // 会话已断/确认过期: 本地收敛为拒绝态, 由 tool_result(或界面)呈现结果
-    patchConfirmStatus(callId, 'denied')
+    // 决策失败 = 确认卡已过期/对话流已终止(后端 404): 收敛为过期态而非拒绝,
+    // 语义上"超时未执行"≠"用户主动取消"。
+    patchConfirmStatus(callId, 'expired')
   }
+}
+
+/** 确认卡倒计时到点回调: 仍处 awaiting 的卡自动置为 expired(后端同刻视为超时)。 */
+export function expireConfirm(callId: string) {
+  patchActiveSession(session => {
+    const target = session.messages
+      .flatMap(m => (m.role === 'footprint' ? m.calls : []))
+      .find(c => c.callId === callId)
+    if (!target || target.status !== 'awaiting') return session
+    return {
+      ...session,
+      messages: session.messages.map(m => m.role === 'footprint'
+        ? {
+            ...m,
+            calls: m.calls.map(c => (c.callId === callId && c.status === 'awaiting'
+              ? { ...c, status: 'expired' as ToolCallStatus }
+              : c)),
+          }
+        : m),
+    }
+  })
 }
 
 function patchConfirmStatus(callId: string, status: ToolCallStatus) {

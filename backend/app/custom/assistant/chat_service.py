@@ -196,6 +196,9 @@ async def chat_stream(
 
     queue: asyncio.Queue = asyncio.Queue()
     sentinel: object = object()
+    # 本对话流登记、尚待决策的确认卡 call_id; 流异常终止/取消时统一回收,
+    # 避免挂起动作泄漏成"死卡"(点了 404 但前端无终态)。
+    pending_actions: set[str] = set()
 
     async def execute(name: str, args: dict[str, Any]) -> dict[str, Any]:
         call_id = assistant_actions.new_call_id()
@@ -211,6 +214,7 @@ async def chat_stream(
         # 拒绝/超时按工具错误契约回填(ok=False), 模型据此改走文字建议而非重试。
         if name in assistant_actions.ACTION_TOOLS:
             action = await assistant_actions.registry.register(call_id, name, args)
+            pending_actions.add(call_id)
             meta = assistant_actions.ACTION_META.get(name, {"label": name, "risk": ""})
             await queue.put({
                 "type": "action_confirm",
@@ -221,6 +225,7 @@ async def chat_stream(
                 "expires_in": int(assistant_actions.registry.timeout_s),
             })
             decision = await assistant_actions.registry.await_decision(action)
+            pending_actions.discard(call_id)
             if decision != "approved":
                 denied = (
                     "用户已拒绝该操作, 未执行。不要重复尝试同一操作。"
@@ -284,6 +289,7 @@ async def chat_stream(
                     action = await assistant_actions.registry.register(
                         checkpoint_id, "rounds_continue", {"reached": tool_rounds},
                     )
+                    pending_actions.add(checkpoint_id)
                     await queue.put({
                         "type": "rounds_confirm",
                         "call_id": checkpoint_id,
@@ -330,6 +336,9 @@ async def chat_stream(
         except Exception as exc:  # 单轮失败收敛为 error 事件, 不打断流
             await queue.put(_classify_exception(exc))
         finally:
+            # 流终止(含异常/取消): 回收仍挂起的确认卡, 等待方按超时语义收敛。
+            for stale_id in list(pending_actions):
+                assistant_actions.registry.expire(stale_id)
             await queue.put({"type": "done"})
             await queue.put(sentinel)
 

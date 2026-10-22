@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import * as echarts from 'echarts'
+import { initEChart, resizeEChart } from '@/lib/chartDpr'
 import type { ECharts, EChartsOption } from 'echarts'
 import type { MinuteKlineRow, PriceLimitInfo } from '@/lib/api'
 import { computeIntradayAverage, formatMinuteTime, FULL_DAY_TIMES, summarizeMinutes, type DailySummary } from '@/lib/intraday-chart'
@@ -457,7 +457,7 @@ export function EChartsIntraday({
 
     let chart = chartRef.current
     if (!chart) {
-      chart = echarts.init(el, undefined, { renderer: 'canvas' })
+      chart = initEChart(el)
       chartRef.current = chart
       // 强制 canvas 使用十字光标，覆盖 ECharts 默认的 pointer
       const forceCursor = () => {
@@ -470,7 +470,7 @@ export function EChartsIntraday({
       mo.observe(el, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] })
       moRef.current = mo
       roRef.current = new ResizeObserver(() => {
-        chart!.resize()
+        resizeEChart(chart)
         forceCursor()
       })
       roRef.current.observe(el)

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback, useMemo } from 'react'
 import { chartTheme, getTheme, useTheme } from '@/lib/theme'
 import { fmtPct } from '@/lib/format'
-import * as echarts from 'echarts'
+import { initEChart, resizeEChart } from '@/lib/chartDpr'
 import type { ECharts, EChartsOption } from 'echarts'
 
 export interface OHLC {
@@ -1061,7 +1061,7 @@ export function EChartsCandlestick({
     const hoverEl = hoverSurfaceRef.current
     if (!el || !hoverEl) return
 
-    const chart = echarts.init(el, undefined, { renderer: 'canvas' })
+    const chart = initEChart(el)
     chartRef.current = chart
 
     // 信息栏内容由本组件直接写 innerHTML; 悬停显隐与悬停 K 线变化共用这一处写入口
@@ -1154,7 +1154,7 @@ export function EChartsCandlestick({
       }
     })
 
-    const ro = new ResizeObserver(() => { chart.resize() })
+    const ro = new ResizeObserver(() => { resizeEChart(chart) })
     ro.observe(el)
 
     return () => {

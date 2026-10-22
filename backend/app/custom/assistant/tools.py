@@ -787,24 +787,73 @@ def _create_signal_strategy(args: dict[str, Any], ctx: ToolContext) -> dict[str,
 
 
 def _add_to_watchlist(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """加入自选(动作工具)。支持单只(symbol/note)与批量(symbols)两种参数形式,
+    可选 group 按名称指定分组: 不存在则创建, 已存在的分组直接复用; 已在自选的
+    标的只并入分组、不改动既有备注与顺序。"""
     from app.services import watchlist as watchlist_service
 
-    symbol = _validate_symbol(args.get("symbol"))
-    note = str(args.get("note") or "").strip()[:80]
-    current = watchlist_service.list_symbols()
-    if symbol in {str(r.get("symbol")) for r in current}:
-        return {
-            "added": False,
-            "symbol": symbol,
-            "total": len(current),
-            "note": f"{symbol} 已在自选列表中, 未重复添加。",
-        }
-    rows = watchlist_service.add(symbol, note=note)
+    # 参数解析: 批量 symbols 优先, 兼容旧单只 symbol/note 形式。
+    raw_items = args.get("symbols")
+    if isinstance(raw_items, list) and raw_items:
+        items: list[dict[str, Any]] = []
+        for it in raw_items[:50]:
+            if isinstance(it, dict):
+                items.append({"symbol": it.get("symbol"), "note": it.get("note")})
+            else:
+                items.append({"symbol": it, "note": ""})
+    else:
+        items = [{"symbol": args.get("symbol"), "note": args.get("note")}]
+    if not items:
+        raise ValueError("缺少待添加标的: 传 symbol 或 symbols。")
+
+    group_name = str(args.get("group") or "").strip()
+    group_id: str | None = None
+    if group_name:
+        group_name = group_name[:30]
+        existing = next(
+            (g for g in watchlist_service.list_groups() if str(g.get("name")) == group_name),
+            None,
+        )
+        if existing is not None:
+            group_id = str(existing.get("id"))
+        else:
+            _, group = watchlist_service.create_group(group_name)
+            group_id = str(group.get("id"))
+
+    current = {str(r.get("symbol")) for r in watchlist_service.list_symbols()}
+    added: list[str] = []
+    merged: list[str] = []
+    for it in items:
+        symbol = _validate_symbol(it.get("symbol"))
+        note = str(it.get("note") or "").strip()[:80]
+        if symbol in current:
+            # 已在自选: 仅并入目标分组, 不动既有备注/顺序; 无分组则整只跳过。
+            if group_id is not None:
+                watchlist_service.add_to_group(symbol, group_id)
+                merged.append(symbol)
+        else:
+            watchlist_service.add(symbol, note=note, group_id=group_id)
+            current.add(symbol)
+            added.append(symbol)
+
+    total = len(watchlist_service.list_symbols())
+    parts: list[str] = []
+    if added:
+        preview = ", ".join(added[:8]) + ("…" if len(added) > 8 else "")
+        parts.append(f"新增 {len(added)} 只({preview})")
+    if merged:
+        parts.append(f"{len(merged)} 只已在自选, 已并入分组")
+    if not parts:
+        parts.append("全部标的均已在自选列表中, 未重复添加")
+    group_note = f"并归入分组「{group_name}」" if group_id is not None else ""
     return {
-        "added": True,
-        "symbol": symbol,
-        "total": len(rows),
-        "note": f"已把 {symbol} 加入自选列表(当前共 {len(rows)} 只)。",
+        "added": bool(added),
+        "added_count": len(added),
+        "added_symbols": added,
+        "merged_count": len(merged),
+        "group": group_name or None,
+        "total": total,
+        "note": f"已更新自选列表: {'; '.join(parts)}{group_note}; 当前共 {total} 只。",
     }
 
 
@@ -820,6 +869,175 @@ def _partition_dates(data_dir: Path, subdir: str) -> list[str]:
         return []
     dates = [d.name[5:] for d in root.iterdir() if d.is_dir() and d.name.startswith("date=")]
     return sorted(dates)
+
+
+# ----------------------------------------------------------------
+# 扩展表创建(动作工具): 建表 + 拉取配方 + 调度注册 + 后台首拉。
+# 复用拉取页同一套服务(ExtConfigStore / PullScheduler / fetch_and_ingest),
+# 不新写拉取实现; 只允许新建, id 冲突/凭据缺失/参数非法全部拒绝。
+# ----------------------------------------------------------------
+_EXT_TABLE_ID_RE = re.compile(r"^ext_[a-zA-Z0-9_]{1,60}$")
+_EXT_DTYPES = frozenset({"string", "int", "float", "bool"})
+_EXT_AUTH_TYPES = frozenset({"none", "bearer", "header", "query"})
+# 后台首拉任务引用: 防 GC 中断, 完成即自动移除。
+_FIRST_PULL_TASKS: set[asyncio.Task] = set()
+
+
+def _ext_pull_config_from_args(table_id: str, raw: dict[str, Any]) -> Any:
+    """把工具入参里的 pull 配方转成 PullConfig; 校验失败抛 ValueError(走错误契约)。"""
+    from app.services.ext_data import PullConfig
+
+    url = str(raw.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("pull.url 必须是 http(s) 地址。")
+    method = str(raw.get("method") or "GET").upper()
+    if method not in {"GET", "POST"}:
+        raise ValueError("pull.method 只支持 GET / POST。")
+    headers = {str(k): str(v) for k, v in list((raw.get("headers") or {}).items())[:10]}
+    body = raw.get("body")
+    body = str(body) if body is not None else None
+    field_map = {str(k): str(v) for k, v in list((raw.get("field_map") or {}).items())[:50]}
+
+    # 鉴权: 只允许引用凭据仓已有 key(key_ref), 不接收明文密钥。
+    auth_raw = raw.get("auth") or {}
+    auth_type = str(auth_raw.get("type") or "none").lower()
+    if auth_type not in _EXT_AUTH_TYPES:
+        raise ValueError("pull.auth.type 只支持 none/bearer/header/query。")
+    auth: dict[str, Any] | None = None
+    if auth_type != "none":
+        from app import secrets_store
+
+        key_ref = str(auth_raw.get("key_ref") or "").strip()
+        if not key_ref:
+            raise ValueError(
+                "配置鉴权时必须给 auth.key_ref (引用 设置→数据源 已有凭据, 如 fuyao_api_key)。",
+            )
+        if not secrets_store.get_env_backed_secret(key_ref, key_ref.upper()):
+            raise ValueError(f"凭据 {key_ref} 不存在 — 请先在 设置 → 数据源 配置对应 API Key。")
+        auth = {"type": auth_type, "key_ref": key_ref}
+        if auth_type in {"bearer", "header"} and auth_raw.get("header"):
+            auth["header"] = str(auth_raw["header"])
+        if auth_type == "query" and auth_raw.get("param"):
+            auth["param"] = str(auth_raw["param"])
+
+    sched = raw.get("schedule") or {}
+    schedule_minutes = _clamp(sched.get("every_minutes", 1440), 5, 10080, 1440)
+    schedule_time = str(sched.get("time") or "").strip() or None
+    trading_only = bool(sched.get("trading_only"))
+
+    return PullConfig(
+        url=url,
+        method=method,
+        headers=headers,
+        body=body,
+        response_path=str(raw.get("response_path") or ""),
+        field_map=field_map,
+        schedule_minutes=schedule_minutes,
+        enabled=True,
+        auth=auth,
+        schedule_time=schedule_time,
+        schedule_trading_only=trading_only,
+        timeout_seconds=_clamp(raw.get("timeout_seconds", 30), 5, 120, 30),
+    )
+
+
+async def _create_ext_table(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """创建扩展数据表并配置自动拉取(动作工具, 须确认卡确认)。
+
+    建表复用 ExtConfigStore; 配置了 pull 配方时注册 PullScheduler 定时任务
+    并在后台发起首次拉取 — 首拉失败不回滚表(表本身有效), 状态写回
+    pull.last_status 供拉取页/AI 查询。
+    """
+    from datetime import datetime
+
+    from app.services import ext_data as ext_service
+    from app.services import ext_pull
+
+    if ctx.data_dir is None:
+        raise ValueError("数据目录未就绪。")
+    data_dir = Path(ctx.data_dir)
+
+    table_id = str(args.get("table_id") or "").strip()
+    if not _EXT_TABLE_ID_RE.fullmatch(table_id):
+        raise ValueError("table_id 须以 ext_ 开头、仅含字母/数字/下划线 (≤64 字符), 如 ext_region_revenue。")
+    label = str(args.get("label") or "").strip()[:64]
+    if not label:
+        raise ValueError("label 不能为空。")
+    mode = str(args.get("mode") or "")
+    if mode not in {"snapshot", "timeseries"}:
+        raise ValueError("mode 必须是 snapshot(每日快照) 或 timeseries(时序)。")
+
+    raw_fields = args.get("fields")
+    if not isinstance(raw_fields, list) or not 1 <= len(raw_fields) <= 50:
+        raise ValueError("fields 须为 1-50 个字段定义。")
+    fields = []
+    for f in raw_fields:
+        name = str((f or {}).get("name") or "").strip()
+        if not name or not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", name):
+            raise ValueError(f"非法字段名: {name!r} (字母开头, 字母/数字/下划线)。")
+        dtype = str((f or {}).get("dtype") or "string")
+        if dtype not in _EXT_DTYPES:
+            raise ValueError(f"字段 {name} 的 dtype 只支持 string/int/float/bool。")
+        fields.append(ext_service.ExtField(name, dtype, str((f or {}).get("label") or "")[:64]))
+
+    store = ext_service.ExtConfigStore(data_dir)
+    if store.get(table_id) is not None:
+        raise ValueError(f"扩展表 {table_id} 已存在; 本工具仅支持新建, 修改/删除请到 拉取 页。")
+
+    pull_raw = args.get("pull")
+    pull = _ext_pull_config_from_args(table_id, pull_raw) if isinstance(pull_raw, dict) and pull_raw else None
+
+    market_level = bool(args.get("market_level"))
+    config = ext_service.ExtConfig(
+        table_id, label, mode, fields,
+        description=str(args.get("description") or "")[:500],
+        market_level=market_level,
+        pull=pull,
+    )
+    store.upsert(config)
+
+    first_pull = "skipped"
+    schedule_note = "未配置自动拉取(可到 拉取 页上传/手动写入数据)"
+    if pull is not None:
+        # 注册/刷新定时任务(线程安全), 后台首拉不阻塞对话流。
+        ext_pull.pull_scheduler.refresh(data_dir)
+        first_pull = "started"
+        schedule_note = (
+            f"已注册自动拉取(每 {pull.schedule_minutes} 分钟"
+            + (", 仅交易日" if pull.schedule_trading_only else "")
+            + (f", 定时 {pull.schedule_time}" if pull.schedule_time else "")
+            + ")"
+        )
+
+        # 持有任务引用防 GC/防 RUF006; 完成后自动释放。
+        async def _first_pull() -> None:
+            try:
+                await ext_pull.fetch_and_ingest(config, data_dir, keep_strategy_cache=True)
+            except Exception as exc:  # 首拉失败不回滚表, 状态写回供排查
+                failed = store.get(table_id)
+                if failed and failed.pull:
+                    failed.pull.last_run = datetime.now(datetime.UTC).isoformat()
+                    failed.pull.last_status = "error"
+                    failed.pull.last_message = f"首拉失败: {exc}"[:200]
+                    store.upsert(failed, keep_strategy_cache=True)
+
+        first_pull_task = asyncio.create_task(_first_pull())
+        _FIRST_PULL_TASKS.add(first_pull_task)
+        first_pull_task.add_done_callback(_FIRST_PULL_TASKS.discard)
+    return {
+        "created": True,
+        "table_id": table_id,
+        "label": label,
+        "mode": mode,
+        "field_count": len(fields),
+        "scheduled": pull is not None,
+        "first_pull": first_pull,
+        "schedule_note": schedule_note,
+        "note": (
+            f"已创建扩展表「{label}」({table_id}, {len(fields)} 字段); {schedule_note}"
+            + ("; 首次拉取已在后台执行, 可用 get_sync_status 或 拉取 页查看结果。" if first_pull == "started" else "。")
+        ),
+    }
 
 
 def _biz_days_behind(latest_iso: str | None, today: date) -> int:
@@ -1188,6 +1406,7 @@ _LOCAL_TOOLS: dict[str, Callable[[dict[str, Any], ToolContext], Any]] = {
     "get_factor_values": _get_factor_values,
     "create_signal_strategy": _create_signal_strategy,
     "add_to_watchlist": _add_to_watchlist,
+    "create_ext_table": _create_ext_table,
     "check_data_coverage": _check_data_coverage,
     "list_ext_tables": _list_ext_tables,
     "query_ext_table": _query_ext_table,
@@ -1352,12 +1571,90 @@ def _local_tool_schemas() -> list[dict[str, Any]]:
         ),
         _schema(
             "add_to_watchlist",
-            "把一只标的加入用户自选列表(动作工具, 须用户在确认卡上确认后才执行)。",
+            "把标的加入用户自选列表(动作工具, 须用户在确认卡上确认后才执行)。"
+            "批量添加(如一批 ETF/股票)必须用 symbols 数组一次传入, 只弹一张确认卡; "
+            "可选 group 按名称指定分组(不存在会自动创建), 已在自选的标的会并入该分组。",
             {
-                "symbol": {"type": "string", "description": "证券代码, 如 600519.SH"},
-                "note": {"type": "string", "description": "备注 (可选, ≤80 字)"},
+                "symbol": {"type": "string", "description": "单只添加: 证券代码, 如 600519.SH (与 symbols 二选一)"},
+                "note": {"type": "string", "description": "单只添加的备注 (可选, ≤80 字)"},
+                "symbols": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "description": "批量添加: 标的数组, 每项 {symbol, note}",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {"type": "string", "description": "证券代码"},
+                            "note": {"type": "string", "description": "备注 (可选)"},
+                        },
+                        "required": ["symbol"],
+                    },
+                },
+                "group": {"type": "string", "description": "目标分组名称 (可选, ≤30 字, 不存在则创建), 如 ETF"},
             },
-            ["symbol"],
+            [],
+        ),
+        _schema(
+            "create_ext_table",
+            "创建扩展数据表并配置自动拉取(动作工具, 须用户在确认卡上确认后才执行)。"
+            "用户需要监控扩展数据(如分地区收入/在手订单/自定义榜单)且数据源有可访问 API 时使用; "
+            "数据源没有对应 API 时如实说明, 不要编造 URL。表创建后由调度器自动拉取, 用户无需再手动操作。",
+            {
+                "table_id": {"type": "string", "description": "表 ID, ext_ 前缀 + 字母/数字/下划线, 如 ext_region_revenue"},
+                "label": {"type": "string", "description": "表显示名, 如「分地区收入」"},
+                "mode": {"type": "string", "enum": ["snapshot", "timeseries"], "description": "snapshot=每日快照 / timeseries=时序"},
+                "fields": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "description": "字段(列)定义",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "字段名, 字母开头"},
+                            "dtype": {"type": "string", "enum": ["string", "int", "float", "bool"], "description": "默认 string"},
+                            "label": {"type": "string", "description": "显示名 (可选)"},
+                        },
+                        "required": ["name"],
+                    },
+                },
+                "description": {"type": "string", "description": "表说明 (可选)"},
+                "market_level": {"type": "boolean", "description": "市场级表(行=全市场每日一条, 无 symbol 列), 默认 false"},
+                "pull": {
+                    "type": "object",
+                    "description": "自动拉取配方 (可选; 不配则建表后手动上传/写入)",
+                    "properties": {
+                        "url": {"type": "string", "description": "数据 API 地址 (http/https)"},
+                        "method": {"type": "string", "enum": ["GET", "POST"], "description": "默认 GET"},
+                        "headers": {"type": "object", "description": "附加请求头 (可选)"},
+                        "body": {"type": "string", "description": "POST body 模板 (可选)"},
+                        "response_path": {"type": "string", "description": "响应中行数组的 dot-path, 如 data.list"},
+                        "field_map": {"type": "object", "description": "外部字段 → 表字段 映射 (可选)"},
+                        "auth": {
+                            "type": "object",
+                            "description": "鉴权 (可选): {type: bearer|header|query, key_ref: 凭据名(引用 设置→数据源 已有 Key, 如 fuyao_api_key)}",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["bearer", "header", "query"]},
+                                "key_ref": {"type": "string"},
+                                "header": {"type": "string"},
+                                "param": {"type": "string"},
+                            },
+                            "required": ["type", "key_ref"],
+                        },
+                        "schedule": {
+                            "type": "object",
+                            "description": "调度 (可选): every_minutes(默认 1440) / time(如 15:40) / trading_only",
+                            "properties": {
+                                "every_minutes": {"type": "integer"},
+                                "time": {"type": "string"},
+                                "trading_only": {"type": "boolean"},
+                            },
+                        },
+                        "timeout_seconds": {"type": "integer", "description": "默认 30"},
+                    },
+                    "required": ["url"],
+                },
+            },
+            ["table_id", "label", "mode", "fields"],
         ),
         _schema(
             "check_data_coverage",
@@ -1512,6 +1809,8 @@ def summarize_tool_result(name: str, payload: dict[str, Any]) -> str:
         return f"创建信号 {signal.get('name', '-')} ({signal.get('id', '-')})"
     if name == "add_to_watchlist":
         return result.get("note") or "已加入自选"
+    if name == "create_ext_table":
+        return result.get("schedule_note") or "已建表(未配置自动拉取)"
     if name == "check_data_coverage":
         issue_count = len(result.get("issues") or [])
         return f"发现 {issue_count} 项数据缺口" if issue_count else "数据完整, 无缺口"

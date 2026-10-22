@@ -24,6 +24,7 @@ ACTION_TOOLS: frozenset[str] = frozenset({
     "create_signal_strategy",
     "run_backtest",
     "add_to_watchlist",
+    "create_ext_table",
     "sync_data",
 })
 
@@ -40,6 +41,10 @@ ACTION_META: dict[str, dict[str, str]] = {
     "add_to_watchlist": {
         "label": "加入自选",
         "risk": "将修改你的自选列表",
+    },
+    "create_ext_table": {
+        "label": "创建扩展数据表",
+        "risk": "将创建扩展表并立即从外部数据源拉取数据, 之后按调度自动执行; 表创建后可在 拉取 页管理",
     },
     "sync_data": {
         "label": "数据补全/同步",
@@ -101,6 +106,17 @@ class PendingRegistry:
             self._pending.pop(action.call_id, None)
             return "expired"
         return action.decision or "denied"
+
+    def expire(self, call_id: str) -> None:
+        """对话流异常终止/取消时回收挂起动作: 视为过期(不执行), 唤醒等待方。
+
+        与决策超时同语义 — 等待方拿到 'expired' 走「确认超时未执行」回填,
+        晚到的决策端点对该 call_id 返回 404, 前后端状态一致。
+        """
+        action = self._pending.pop(call_id, None)
+        if action is not None:
+            action.decision = "expired"
+            action.event.set()
 
     def _sweep_expired(self) -> None:
         """register 时顺手回收早已超时但等待方已消失的条目(如客户端断连)。"""

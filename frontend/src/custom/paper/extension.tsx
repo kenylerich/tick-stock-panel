@@ -15,6 +15,7 @@
  */
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { initEChart, resizeEChart } from '@/lib/chartDpr'
 import * as echarts from 'echarts'
 import { Banknote, ChevronDown, ChevronUp, CircleDollarSign, GitCompare, History, ListChecks, PieChart, Plus, RefreshCw, Settings, ShieldAlert, SlidersHorizontal, Snowflake, Trash2, TrendingUp, Wallet, X, Zap } from 'lucide-react'
 import { createPortal } from 'react-dom'
@@ -66,8 +67,8 @@ function NavChart({ nav }: { nav: Array<{ date: string; nav: number; benchmark_c
 
   useEffect(() => {
     if (!elRef.current) return
-    chartRef.current = echarts.init(elRef.current, undefined, { renderer: 'canvas' })
-    const onResize = () => chartRef.current?.resize()
+    chartRef.current = initEChart(elRef.current)
+    const onResize = () => resizeEChart(chartRef.current)
     window.addEventListener('resize', onResize)
     // 跟随亮暗主题切换重设坐标轴配色
     const observer = new MutationObserver(() => {
@@ -1105,8 +1106,8 @@ function CompareChart({ rows }: { rows: PaperCompareRow[] }) {
 
   useEffect(() => {
     if (!elRef.current) return
-    chartRef.current = echarts.init(elRef.current, undefined, { renderer: 'canvas' })
-    const onResize = () => chartRef.current?.resize()
+    chartRef.current = initEChart(elRef.current)
+    const onResize = () => resizeEChart(chartRef.current)
     window.addEventListener('resize', onResize)
     const observer = new MutationObserver(() => {
       const darkNow = document.documentElement.classList.contains('dark')

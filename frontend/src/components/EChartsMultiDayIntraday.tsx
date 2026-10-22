@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import * as echarts from 'echarts'
+import { initEChart, resizeEChart } from '@/lib/chartDpr'
 import type { ECharts, EChartsOption } from 'echarts'
 import type { MinuteKlineRow, MinuteKlineSession } from '@/lib/api'
 import { computeIntradayAverage, formatMinuteTime, FULL_DAY_TIMES } from '@/lib/intraday-chart'
@@ -170,9 +170,9 @@ export function EChartsMultiDayIntraday({
 
     let chart = chartRef.current
     if (!chart) {
-      chart = echarts.init(container, undefined, { renderer: 'canvas' })
+      chart = initEChart(container)
       chartRef.current = chart
-      resizeObserverRef.current = new ResizeObserver(() => chart?.resize())
+      resizeObserverRef.current = new ResizeObserver(() => resizeEChart(chart))
       resizeObserverRef.current.observe(container)
 
       chart.on('updateAxisPointer', (event: any) => {

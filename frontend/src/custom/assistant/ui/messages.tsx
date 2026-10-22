@@ -5,12 +5,13 @@
  * 数字等宽, 红涨绿跌语义色仅用于价格; AI 正文不用气泡(通栏 + 引导线),
  * 工具足迹可展开核对原始参数 — 结果可核对是本模块的体验铁律。
  */
-import { memo, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
 import {
   AlertCircle,
   CheckCircle2,
   ChevronDown,
+  Clock,
   Loader2,
   ShieldAlert,
   Wrench,
@@ -18,7 +19,7 @@ import {
 import { MarkdownRenderer } from '@/components/financials/MarkdownRenderer'
 import { cn } from '@/lib/cn'
 import type { ChatMessage, ToolCallRecord } from '../store'
-import { decideAction } from '../store'
+import { decideAction, expireConfirm } from '../store'
 import { DailyChartCard } from './DailyChartCard'
 
 export const UserBubble = memo(function UserBubble({ content }: { content: string }) {
@@ -212,6 +213,9 @@ function ToolCallRow({ call }: { call: ToolCallRecord }) {
         )}
       </div>
       {call.status === 'awaiting' && call.confirm && <ConfirmCard call={call} />}
+      {call.status === 'expired' && (
+        <div className="mt-0.5 pl-5 text-[11px] text-muted">已超时未执行</div>
+      )}
       {call.summary && (
         <div className={cn('mt-0.5 pl-5', call.status === 'error' ? 'text-danger' : 'text-secondary')}>
           {call.summary}
@@ -233,11 +237,34 @@ function ToolCallRow({ call }: { call: ToolCallRecord }) {
  * 动作工具确认卡: 参数完整可见(用户确认前必须能核对待执行内容 —
  * 可核对铁律), 确认/取消 POST 决策端点; 120 秒未决策后端自动拒绝。
  */
+/** 倒计时: 每秒刷新剩余秒; 到点触发过期回调(后端同刻按超时处理, 前后端一致)。 */
+function useCountdown(expiresAt: number | undefined, onExpire: () => void): number | null {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (expiresAt === undefined) return
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [expiresAt])
+  useEffect(() => {
+    if (expiresAt === undefined) return
+    if (now >= expiresAt) {
+      onExpire()
+      return
+    }
+    const timeout = setTimeout(() => setNow(Date.now()), expiresAt - now)
+    return () => clearTimeout(timeout)
+  }, [now, expiresAt, onExpire])
+  return expiresAt === undefined ? null : Math.max(0, Math.ceil((expiresAt - now) / 1000))
+}
+
 function ConfirmCard({ call }: { call: ToolCallRecord }) {
   const confirm = call.confirm!
   const isRounds = call.name === '__rounds'
+  const callId = call.callId
+  const remaining = useCountdown(confirm.expiresAt, () => expireConfirm(callId))
+  const expired = remaining !== null && remaining <= 0
   return (
-    <div className="mt-1 ml-5 rounded-card border border-border bg-elevated/60 p-2">
+    <div className={cn('mt-1 ml-5 rounded-card border border-border bg-elevated/60 p-2', expired && 'opacity-60')}>
       <div className="flex items-center gap-1.5 text-foreground">
         <ShieldAlert className="h-3.5 w-3.5 shrink-0 text-danger" />
         <span className="font-medium">{confirm.label}{isRounds ? ' · 需要你的选择' : ' · 需要你的确认'}</span>
@@ -248,25 +275,36 @@ function ConfirmCard({ call }: { call: ToolCallRecord }) {
           {JSON.stringify(call.args, null, 2)}
         </pre>
       )}
-      <div className="mt-2 flex items-center gap-2">
-        <button
-          type="button"
-          onClick={() => { void decideAction(call.callId, true) }}
-          className="cursor-pointer rounded-btn bg-accent/15 px-2.5 py-1 font-medium text-accent transition-colors duration-150 ease-smooth hover:bg-accent/25"
-        >
-          {isRounds ? '继续' : '确认执行'}
-        </button>
-        <button
-          type="button"
-          onClick={() => { void decideAction(call.callId, false) }}
-          className="cursor-pointer rounded-btn px-2.5 py-1 text-secondary transition-colors duration-150 ease-smooth hover:bg-elevated hover:text-foreground"
-        >
-          {isRounds ? '停止' : '取消'}
-        </button>
-        <span className="text-[10px] text-muted">
-          {isRounds ? '120 秒内未选择将自动停止' : '120 秒内未确认将自动取消'}
-        </span>
-      </div>
+      {expired
+        ? (
+            <div className="mt-2 flex items-center gap-1.5 text-[11px] text-muted">
+              <Clock className="h-3 w-3" />
+              已超时未执行 — 请重新发起该操作
+            </div>
+          )
+        : (
+            <div className="mt-2 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => { void decideAction(call.callId, true) }}
+                className="cursor-pointer rounded-btn bg-accent/15 px-2.5 py-1 font-medium text-accent transition-colors duration-150 ease-smooth hover:bg-accent/25"
+              >
+                {isRounds ? '继续' : '确认执行'}
+              </button>
+              <button
+                type="button"
+                onClick={() => { void decideAction(call.callId, false) }}
+                className="cursor-pointer rounded-btn px-2.5 py-1 text-secondary transition-colors duration-150 ease-smooth hover:bg-elevated hover:text-foreground"
+              >
+                {isRounds ? '停止' : '取消'}
+              </button>
+              {remaining !== null && (
+                <span className="font-mono text-[10px] text-muted" aria-label="确认剩余秒数">
+                  {remaining}s 后自动取消
+                </span>
+              )}
+            </div>
+          )}
     </div>
   )
 }

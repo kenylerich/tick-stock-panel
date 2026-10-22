@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import * as echarts from 'echarts'
+import { initEChart, resizeEChart } from '@/lib/chartDpr'
 import type { ECharts, EChartsOption } from 'echarts'
 
 /**
@@ -22,8 +22,8 @@ export function useECharts(
   useEffect(() => {
     if (!chartRef.current) return
     const container = chartRef.current
-    instanceRef.current = echarts.init(container, undefined, { renderer: 'canvas' })
-    const resizeObserver = new ResizeObserver(() => instanceRef.current?.resize())
+    instanceRef.current = initEChart(container)
+    const resizeObserver = new ResizeObserver(() => resizeEChart(instanceRef.current))
     resizeObserver.observe(container)
 
     return () => {

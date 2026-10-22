@@ -252,6 +252,189 @@ async def test_add_to_watchlist_roundtrip(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert added == [("600519.SH", "白酒龙头")]  # 第二次未调用 add
 
 
+async def test_add_to_watchlist_batch_with_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """批量 + 分组: 一次调用加多只, 已在自选的并入分组不动备注。"""
+    from app.services import watchlist as watch_service
+
+    calls: dict[str, list[tuple]] = {"add": [], "group": []}
+    monkeypatch.setattr(watch_service, "list_symbols", lambda: [{"symbol": "000001.SZ"}])
+    monkeypatch.setattr(watch_service, "list_groups", lambda: [{"id": "g1", "name": "ETF"}])
+    monkeypatch.setattr(
+        watch_service, "add",
+        lambda symbol, note="", group_id=None:
+            calls["add"].append((symbol, note, group_id)) or [{"symbol": symbol}],
+    )
+    monkeypatch.setattr(
+        watch_service, "add_to_group",
+        lambda symbol, gid: calls["group"].append((symbol, gid)) or [],
+    )
+    created: list[str] = []
+    monkeypatch.setattr(
+        watch_service, "create_group",
+        lambda name, color=None: (created.append(name), ([], {"id": "g2", "name": name}))[1],
+    )
+    ctx = assistant_tools.ToolContext.build(data_dir=tmp_path)
+
+    payload = await assistant_tools.execute_assistant_tool(
+        "add_to_watchlist",
+        {
+            "symbols": [
+                {"symbol": "513100.SH", "note": "纳指100"},
+                {"symbol": "159941.SZ", "note": "纳指广发"},
+                {"symbol": "000001.SZ", "note": "已在自选"},
+            ],
+            "group": "ETF",
+        },
+        ctx,
+    )
+    result = payload["result"]
+    assert payload["ok"] is True
+    assert result["added_count"] == 2
+    assert result["added_symbols"] == ["513100.SH", "159941.SZ"]
+    assert result["merged_count"] == 1
+    assert result["group"] == "ETF"
+    # 新标的带备注与分组写入
+    assert calls["add"] == [
+        ("513100.SH", "纳指100", "g1"),
+        ("159941.SZ", "纳指广发", "g1"),
+    ]
+    # 已在自选的只并入分组, 不重写备注/顺序
+    assert calls["group"] == [("000001.SZ", "g1")]
+    assert "ETF" in result["note"]
+
+    # 分组不存在时自动创建并复用新 id
+    monkeypatch.setattr(watch_service, "list_groups", lambda: [])
+    payload2 = await assistant_tools.execute_assistant_tool(
+        "add_to_watchlist",
+        {"symbols": [{"symbol": "513500.SH", "note": "标普500"}], "group": "QDII"},
+        ctx,
+    )
+    assert payload2["ok"] is True
+    assert created == ["QDII"]
+    assert calls["add"][-1] == ("513500.SH", "标普500", "g2")
+
+
+async def test_create_ext_table_roundtrip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """建表 + 拉取配方: store 落盘、调度注册、后台首拉、返回契约。"""
+    from app.services import ext_pull
+
+    refreshed: list[Path] = []
+    pulled: list[str] = []
+
+    async def _fake_fetch(config, data_dir, *args, **kwargs):  # noqa: ANN001
+        pulled.append(config.id)
+        return (10, "2026-10-20")
+
+    monkeypatch.setattr(ext_pull.pull_scheduler, "refresh", lambda d: refreshed.append(d))
+    monkeypatch.setattr(ext_pull, "fetch_and_ingest", _fake_fetch)
+
+    ctx = assistant_tools.ToolContext.build(data_dir=tmp_path)
+    payload = await assistant_tools.execute_assistant_tool(
+        "create_ext_table",
+        {
+            "table_id": "ext_region_revenue",
+            "label": "分地区收入",
+            "mode": "timeseries",
+            "fields": [
+                {"name": "region", "dtype": "string", "label": "地区"},
+                {"name": "revenue", "dtype": "float", "label": "收入(亿)"},
+            ],
+            "pull": {
+                "url": "https://example.com/api/region-revenue",
+                "response_path": "data.list",
+                "schedule": {"every_minutes": 720, "trading_only": True},
+            },
+        },
+        ctx,
+    )
+    result = payload["result"]
+    assert payload["ok"] is True
+    assert result["created"] is True
+    assert result["scheduled"] is True
+    assert result["first_pull"] == "started"
+    assert refreshed == [Path(tmp_path)]
+    # 表配置已落盘且可读回
+    from app.services.ext_data import ExtConfigStore
+    config = ExtConfigStore(Path(tmp_path)).get("ext_region_revenue")
+    assert config is not None and config.label == "分地区收入"
+    assert config.pull is not None and config.pull.enabled is True
+    assert config.pull.schedule_minutes == 720
+    # 后台首拉任务已调度并执行
+    await asyncio.sleep(0)
+    assert pulled == ["ext_region_revenue"]
+
+    # id 冲突: 已存在的表拒绝新建
+    payload2 = await assistant_tools.execute_assistant_tool(
+        "create_ext_table",
+        {"table_id": "ext_region_revenue", "label": "重复", "mode": "snapshot",
+         "fields": [{"name": "a"}]},
+        ctx,
+    )
+    assert payload2["ok"] is False
+    assert "已存在" in payload2["error"]
+
+
+async def test_create_ext_table_validations(tmp_path: Path) -> None:
+    ctx = assistant_tools.ToolContext.build(data_dir=tmp_path)
+
+    # 非法 table_id
+    payload = await assistant_tools.execute_assistant_tool(
+        "create_ext_table",
+        {"table_id": "bad-id", "label": "x", "mode": "snapshot", "fields": [{"name": "a"}]},
+        ctx,
+    )
+    assert payload["ok"] is False and "table_id" in payload["error"]
+
+    # 非法 dtype
+    payload = await assistant_tools.execute_assistant_tool(
+        "create_ext_table",
+        {"table_id": "ext_t", "label": "x", "mode": "snapshot",
+         "fields": [{"name": "a", "dtype": "decimal"}]},
+        ctx,
+    )
+    assert payload["ok"] is False and "dtype" in payload["error"]
+
+    # 非法 URL
+    payload = await assistant_tools.execute_assistant_tool(
+        "create_ext_table",
+        {"table_id": "ext_t", "label": "x", "mode": "snapshot", "fields": [{"name": "a"}],
+         "pull": {"url": "ftp://not-http"}},
+        ctx,
+    )
+    assert payload["ok"] is False and "url" in payload["error"]
+
+    # 鉴权引用不存在的凭据: fail-closed
+    payload = await assistant_tools.execute_assistant_tool(
+        "create_ext_table",
+        {"table_id": "ext_t", "label": "x", "mode": "snapshot", "fields": [{"name": "a"}],
+         "pull": {"url": "https://e.com/api", "auth": {"type": "bearer", "key_ref": "no_such_key"}}},
+        ctx,
+    )
+    assert payload["ok"] is False and "no_such_key" in payload["error"]
+
+
+def test_create_ext_table_is_gated_action() -> None:
+    """建表是写副作用动作: 必须在确认闸门清单里。"""
+    assert "create_ext_table" in assistant_actions.ACTION_TOOLS
+    assert "create_ext_table" in assistant_actions.ACTION_META
+
+
+async def test_registry_expire_wakes_waiter_as_expired() -> None:
+    """对话流终止时 expire(): 等待方按超时语义收敛, 晚到决策 404。"""
+    reg = assistant_actions.PendingRegistry(timeout_s=30.0)
+    action = await reg.register(assistant_actions.new_call_id(), "add_to_watchlist", {})
+    waiter = asyncio.ensure_future(reg.await_decision(action))
+    await asyncio.sleep(0)
+    reg.expire(action.call_id)
+    assert await waiter == "expired"
+    assert await reg.resolve(action.call_id, True) is None
+    reg.expire(action.call_id)  # 幂等: 已回收的 id 再 expire 不抛错
+
+
 async def test_action_tool_error_contract_via_execute(tmp_path: Path) -> None:
     """非法参数经统一执行入口仍回 ok=False 契约(不抛异常打断对话流)。"""
     ctx = assistant_tools.ToolContext.build(data_dir=tmp_path)
