@@ -16,8 +16,8 @@
 ## 阶段 B:商业模式数据接入
 
 - [x] **B1 AKShare 免费数据桥** → [#4](https://github.com/kenylerich/tick-stock-panel/issues/4) — 独立侧车容器(Docker),桥接东财/同花顺公开数据,接入面板自定义源通道。可插拔:桥故障不影响面板其它功能。验收:设置页新增数据源且健康。
-- [ ] **B2 主营构成数据** → [#5](https://github.com/kenylerich/tick-stock-panel/issues/5) — 分产品/分地区收入与毛利率拆解(每公司一张)。来源 AKShare F10;财报季更新。验收:个股页出现"主营构成"区块。
-- [ ] **B3 公司概况与同行清单** → [#6](https://github.com/kenylerich/tick-stock-panel/issues/6) — 主营描述 + 同行业可比公司名单(横向对比用)。验收:AI 能自动答"它的同行是谁、各自表现"。
+- [x] **B2 主营构成数据** → [#5](https://github.com/kenylerich/tick-stock-panel/issues/5) — 分产品/分地区收入与毛利率拆解(每公司一张)。来源 AKShare F10;财报季更新。验收:个股页出现"主营构成"区块。
+- [x] **B3 公司概况与同行清单** → [#6](https://github.com/kenylerich/tick-stock-panel/issues/6) — 主营描述 + 同行业可比公司名单(横向对比用)。验收:AI 能自动答"它的同行是谁、各自表现"。
 
 ## 阶段 C:AI 经营分析工作流
 
@@ -40,4 +40,5 @@
 ## 变更日志
 
 - 2026-10-21:初版,任务 0-13 项。
+- 2026-10-21:**批次2 完成**(658a6fd): B2+B3, issue #5/#6 已关闭。同行清单因东财板块接口不稳降级为行业名(已标注,不阻塞 C1/C2)。Docker Hub 故障期间基础镜像改由 daocloud 镜像源拉取重标签。
 - 2026-10-21:**批次1 完成**(fc10b2f): A1+A2+B1, issue #2/#3/#4 已关闭。B3 风险已记录在 #6(东财板块成分接口不稳,同行清单降级)。
